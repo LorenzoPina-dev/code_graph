@@ -154,6 +154,7 @@ AGENT_JS = r"""
     const AGENT_ENDPOINT = __AGENT_ENDPOINT__;
     const ROLE_LABEL = {
       match: 'rilevante', callee: 'chiamato', caller: 'chiamante',
+      next: 'poi', previous: 'prima',
       container: 'contenitore', member: 'membro'
     };
 

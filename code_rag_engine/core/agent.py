@@ -30,6 +30,10 @@ from typing import Any, Dict, List, Optional
 from .indexer import CodeGraphIndexer
 from .retriever import HybridRetriever
 from .reranker import CodeReranker
+from .flow_trace import (
+    FLOW_RELS, edge_rels, flow_direction, format_flow, has_flow_edges, has_flow_intent,
+    has_rel, label as flow_label, other_end, step_detail, trace_flow,
+)
 
 _STOPWORDS = {
     "the", "and", "for", "how", "does", "what", "which", "where", "with", "this", "that",
@@ -60,6 +64,11 @@ _LLM_SYSTEM = (
     "in modo conciso (al massimo ~8 frasi), citando i simboli per nome tra backtick. "
     "Nel campo `relevant` metti i NUMERI dei simboli necessari per capire la risposta, nell'ordine "
     "in cui conviene leggerli (dal punto d'ingresso al dettaglio), escludendo quelli non pertinenti. "
+    "Se nel messaggio c'è la sezione «Flussi», descrive archi tipizzati tra simboli: renders = un componente ne "
+    "mostra un altro; navigates_to = navigazione UI (value = schermata di destinazione); redirects_to = redirect; "
+    "api_call = chiamata HTTP verso un endpoint; handled_by = l'endpoint è implementato da quella funzione; "
+    "proxied_by = passa dal gateway; publishes/consumes = evento di dominio; calls = chiamata di funzione. "
+    "Usali per spiegare cosa succede PRIMA e DOPO, nell'ordine in cui avviene. "
     "Rispondi ESCLUSIVAMENTE con un oggetto JSON: {\"answer\": \"...\", \"relevant\": [1, 3, 2]}"
 )
 
@@ -102,7 +111,7 @@ def build_default_llm() -> Optional[AnthropicSynthesizer]:
 
 
 class GraphQuestionAgent:
-    ROLE_ORDER = {"match": 0, "callee": 1, "caller": 1, "container": 2, "member": 3}
+    ROLE_ORDER = {"match": 0, "callee": 1, "caller": 1, "next": 1, "previous": 1, "container": 2, "member": 3}
 
     def __init__(
         self,
@@ -115,6 +124,8 @@ class GraphQuestionAgent:
         per_seed_neighbors: int = 6,
         rerank_margin: float = 5.0,
         code_chars: int = 1500,
+        flow_extra_nodes: int = 24,
+        flow_depth: int = 4,
     ):
         self.indexer = indexer
         self.graph = indexer.graph
@@ -126,6 +137,8 @@ class GraphQuestionAgent:
         self.per_seed = per_seed_neighbors
         self.rerank_margin = rerank_margin   # scarta i seed con rerank_score < migliore - margine
         self.code_chars = code_chars
+        self.flow_extra_nodes = flow_extra_nodes   # nodi aggiuntivi ammessi per i flussi (prima/dopo)
+        self.flow_depth = flow_depth
         self._by_name: Dict[str, List[str]] = {}
         self.refresh_index()
 
@@ -169,6 +182,10 @@ class GraphQuestionAgent:
     def _relation(self, u: str, v: str) -> Optional[str]:
         return (self.graph.get_edge_data(u, v) or {}).get("relation")
 
+    def _has_rel(self, u: str, v: str, rel: str) -> bool:
+        """Un arco puo' portare piu' relazioni insieme (es. calls + renders): si controlla l'insieme."""
+        return has_rel(self.graph, u, v, rel)
+
     # ------------------------------------------------------------------ seed
     def _explicit_seeds(self, question: str, include_tests: bool) -> List[_Seed]:
         seeds: List[_Seed] = []
@@ -200,6 +217,15 @@ class GraphQuestionAgent:
                 if nid not in seen and not self._is_noise(nid, include_tests):
                     seen.add(nid)
                     seeds.append(_Seed(nid, "simbolo citato nella domanda"))
+
+        # c) rotte HTTP citate (es. "/identity/me", "POST /api/v1/items"): nodi `endpoint` del livello flussi
+        for tok in re.findall(r"(?<![\w.:])/[\w{}\-./]*\w", question):
+            path = re.sub(r"^/api(?:/v\d+)?(?=/|$)", "", tok) or "/"
+            path = re.sub(r"\{[^}]*\}|:[A-Za-z_]\w*", "{}", path)
+            for nid, data in self.graph.nodes(data=True):
+                if data.get("symbol_type") == "endpoint" and data.get("path_norm") == path and nid not in seen:
+                    seen.add(nid)
+                    seeds.append(_Seed(nid, f"rotta HTTP citata nella domanda: {tok}"))
 
         return seeds[: self.top_k]
 
@@ -237,10 +263,10 @@ class GraphQuestionAgent:
             succ = list(self.graph.successors(nid))
             pred = list(self.graph.predecessors(nid))
             plan = [
-                ("callee", [v for v in succ if self._relation(nid, v) == "calls"], "chiamato da «{n}»"),
-                ("caller", [u for u in pred if self._relation(u, nid) == "calls"], "chiama «{n}»"),
-                ("container", [u for u in pred if self._relation(u, nid) == "contains"], "contiene «{n}»"),
-                ("member", [v for v in succ if self._relation(nid, v) == "contains"], "definito in «{n}»"),
+                ("callee", [v for v in succ if self._has_rel(nid, v, "calls")], "chiamato da «{n}»"),
+                ("caller", [u for u in pred if self._has_rel(u, nid, "calls")], "chiama «{n}»"),
+                ("container", [u for u in pred if self._has_rel(u, nid, "contains")], "contiene «{n}»"),
+                ("member", [v for v in succ if self._has_rel(nid, v, "contains")], "definito in «{n}»"),
             ]
             for role, ids, template in plan:
                 ids = [i for i in ids if i in self.graph and not self._is_noise(i, include_tests)]
@@ -256,8 +282,52 @@ class GraphQuestionAgent:
                     added += 1
         return nodes
 
+    # ------------------------------------------------------------------ flussi (prima / dopo)
+    def _flow_expand(self, question: str, seeds: List[_Seed], nodes: Dict[str, Dict[str, Any]],
+                     include_tests: bool) -> str:
+        """
+        Aggiunge ai nodi i FLUSSI dei seed: cosa li precede e cosa li segue lungo gli archi tipizzati
+        (renders, navigates_to, redirects_to, api_call, handled_by, proxied_by, publishes, consumes, calls).
+        Cosi' "come funziona il login" include la pagina di registrazione raggiungibile, le chiamate API,
+        il backend che le gestisce e i redirect. Modifica `nodes` e restituisce l'albero testuale dei passi
+        (da mostrare nella risposta e da dare all'LLM). Vuoto se i seed non hanno archi di flusso.
+        """
+        if not seeds or not has_flow_edges(self.graph):
+            return ""
+        intent = has_flow_intent(question)
+        dirs = ["before", "after"] if flow_direction(question) == "both" else [flow_direction(question)]
+        depth, max_steps = (self.flow_depth, 40) if intent else (2, 12)   # senza intento: solo contesto leggero
+        budget = self.flow_extra_nodes
+        sections: List[str] = []
+
+        for s in seeds[:2]:
+            for d in dirs:
+                steps = trace_flow(self.graph, s.node_id, d, max_depth=depth, max_steps=max_steps)
+                if not any(st["rel"] in FLOW_RELS for st in steps):
+                    continue   # solo chiamate di funzione: ci pensa gia' _expand
+                for st in steps:
+                    other = other_end(st, d)
+                    if other in nodes or other not in self.graph or self._is_noise(other, include_tests):
+                        continue
+                    if budget <= 0:
+                        break
+                    detail = step_detail(st)
+                    detail = f", {detail}" if detail else ""
+                    if d == "after":
+                        reason = f"raggiunto da «{flow_label(self.graph, st['src'])}» ({st['rel']}{detail})"
+                        role, via = "next", st["src"]
+                    else:
+                        reason = f"porta a «{flow_label(self.graph, st['dst'])}» ({st['rel']}{detail})"
+                        role, via = "previous", st["dst"]
+                    nodes[other] = {"id": other, "role": role, "rank": None, "reason": reason, "via": via}
+                    budget -= 1
+                title = "dopo" if d == "after" else "prima di"
+                sections.append(f"Flusso {title} «{flow_label(self.graph, s.node_id)}»:\n"
+                                f"{format_flow(self.graph, steps, s.node_id)}")
+        return "\n\n".join(sections)
+
     # ------------------------------------------------------------------ risposte
-    def _describe(self, nodes: Dict[str, Dict[str, Any]]) -> str:
+    def _describe(self, nodes: Dict[str, Dict[str, Any]], flow_text: str = "") -> str:
         seeds = sorted((n for n in nodes.values() if n["role"] == "match"),
                        key=lambda n: n.get("rank") or 0)
         if not seeds:
@@ -281,6 +351,8 @@ class GraphQuestionAgent:
                 parts.append("è chiamato da " + ", ".join(f"`{c}`" for c in callers))
             if parts:
                 lines.append(f"`{self._name(n['id'])}` " + "; ".join(parts) + ".")
+        if flow_text:
+            lines.append("\n" + flow_text)
         return "\n".join(lines)
 
     @staticmethod
@@ -295,7 +367,7 @@ class GraphQuestionAgent:
         except json.JSONDecodeError:
             return None
 
-    def _refine_with_llm(self, question: str, nodes: Dict[str, Dict[str, Any]]):
+    def _refine_with_llm(self, question: str, nodes: Dict[str, Dict[str, Any]], flow_text: str = ""):
         ordered = sorted(nodes.values(),
                          key=lambda n: (self.ROLE_ORDER[n["role"]], n.get("rank") or 999))
         items = []
@@ -309,6 +381,8 @@ class GraphQuestionAgent:
                 f"{(d.get('docstring') or '')[:200]}\n{(d.get('content') or '')[:limit]}"
             )
         user = f"Domanda: {question}\n\nSimboli candidati:\n\n" + "\n\n".join(items)
+        if flow_text:
+            user += "\n\nFlussi (archi tipizzati tra i simboli):\n\n" + flow_text
         raw = self.llm.complete(_LLM_SYSTEM, user)
 
         data = self._parse_json(raw)
@@ -336,8 +410,8 @@ class GraphQuestionAgent:
             counts[t] = counts.get(t, 0) + 1
         rels: Dict[str, int] = {}
         for _, _, d in self.graph.edges(data=True):
-            r = d.get("relation", "related")
-            rels[r] = rels.get(r, 0) + 1
+            for r in (edge_rels(d) or {"related"}):
+                rels[r] = rels.get(r, 0) + 1
         text = (f"Il grafo contiene {self.graph.number_of_nodes()} nodi "
                 f"({', '.join(f'{k}: {v}' for k, v in sorted(counts.items()))}) e "
                 f"{self.graph.number_of_edges()} archi "
@@ -388,12 +462,13 @@ class GraphQuestionAgent:
                                 "Non ho trovato nulla di rilevante nel grafo per questa domanda.", {})
 
         nodes = self._expand(seeds, include_tests)
+        flow_text = self._flow_expand(question, seeds, nodes, include_tests)
 
         if self.llm is not None:
             try:
-                answer, refined = self._refine_with_llm(question, nodes)
+                answer, refined = self._refine_with_llm(question, nodes, flow_text)
                 return self._result(question, "llm", answer, refined)
             except Exception as e:
                 print(f"[!] Sintesi LLM fallita ({e}): uso il riepilogo deterministico.")
 
-        return self._result(question, "retrieval", self._describe(nodes), nodes)
+        return self._result(question, "retrieval", self._describe(nodes, flow_text), nodes)

@@ -244,7 +244,8 @@ class ASTCodeChunker:
         func_types = {
             "function_definition", "function_declaration", "function_item",
             "method_definition", "method_declaration", "constructor_declaration",
-            "arrow_function"
+            "arrow_function", "function_expression", "function",
+            "generator_function_declaration", "generator_function"
         }
 
         def get_node_name(n: Node) -> str:
@@ -260,6 +261,74 @@ class ASTCodeChunker:
                     if sub:
                         return source_bytes[sub.start_byte:sub.end_byte].decode("utf8", errors="replace")
                 return source_bytes[name_n.start_byte:name_n.end_byte].decode("utf8", errors="replace")
+            return ""
+
+        def _txt(x: Node) -> str:
+            return source_bytes[x.start_byte:x.end_byte].decode("utf8", errors="replace")
+
+        def contains_jsx(n: Node) -> bool:
+            """True se il sotto-albero contiene elementi JSX (-> il simbolo e' un componente UI)."""
+            stack = [n]
+            while stack:
+                cur = stack.pop()
+                if cur.type in ("jsx_element", "jsx_self_closing_element", "jsx_fragment"):
+                    return True
+                stack.extend(cur.children)
+            return False
+
+        def describe_callback(call: Node, fn_txt: str) -> str:
+            """Nome descrittivo per una callback anonima passata a una chiamata
+            (es. 'GET /api/v1/x' per app.get("/api/v1/x", ...), 'describe: nome' per i test)."""
+            args = call.child_by_field_name("arguments")
+            first = ""
+            if args is not None and args.named_children:
+                a0 = args.named_children[0]
+                if a0.type in ("string", "template_string"):
+                    first = _txt(a0)[1:-1]
+            verb = fn_txt.split(".")[-1]
+            if verb.lower() in ("get", "post", "put", "patch", "delete", "all", "use") and first.startswith("/"):
+                return f"{verb.upper()} {first}"
+            if first:
+                return f"{verb}: {first[:60]}"
+            return f"{verb}@L{call.start_point[0] + 1}"
+
+        def derive_anonymous_name(n: Node) -> str:
+            """Ricava un nome per funzioni senza nome proprio:
+            const Foo = () => ..., Foo = function(){}, { foo: () => ... }, memo(() => ...),
+            callback di chiamate (route handler, describe/it, ecc.)."""
+            hoc = {"memo", "forwardRef", "useCallback", "useMemo", "observer", "connect", "withRouter", "styled"}
+            cur = n.parent
+            for _ in range(6):
+                if cur is None:
+                    break
+                t = cur.type
+                if t == "variable_declarator":
+                    nm = cur.child_by_field_name("name")
+                    return _txt(nm) if nm is not None and nm.type == "identifier" else ""
+                if t in ("assignment_expression", "augmented_assignment_expression"):
+                    left = cur.child_by_field_name("left")
+                    return _txt(left).split(".")[-1] if left is not None else ""
+                if t == "pair":
+                    key = cur.child_by_field_name("key")
+                    return _txt(key).strip("'\"") if key is not None else ""
+                if t in ("public_field_definition", "field_definition"):
+                    nm = cur.child_by_field_name("name")
+                    return _txt(nm) if nm is not None else ""
+                if t == "arguments":
+                    call = cur.parent
+                    if call is not None and call.type == "call_expression":
+                        fn = call.child_by_field_name("function")
+                        fn_txt = _txt(fn) if fn is not None else ""
+                        if fn_txt.split(".")[-1] in hoc:
+                            cur = call.parent   # memo(() => ...): il nome sta nella variabile a monte
+                            continue
+                        return describe_callback(call, fn_txt)
+                    return ""
+                if t in ("parenthesized_expression", "as_expression", "satisfies_expression",
+                         "await_expression", "non_null_expression"):
+                    cur = cur.parent
+                    continue
+                break
             return ""
 
         def traverse(node: Node, parent_class: Optional[str] = None):
@@ -305,12 +374,16 @@ class ASTCodeChunker:
 
             # FUNZIONI / METODI
             elif ntype in func_types:
-                raw_name = get_node_name(node) or "anonymous"
+                raw_name = get_node_name(node) or derive_anonymous_name(node) or "anonymous"
                 # Pulizia sintattica del nome in C/C++ se include parametri
                 if "(" in raw_name:
                     raw_name = raw_name.split("(")[0].strip()
 
                 sym_type = "method" if parent_class else "function"
+                # Componente UI: funzione con nome Capitalizzato che restituisce JSX
+                if (sym_type == "function" and language in ("tsx", "javascript", "typescript")
+                        and raw_name[:1].isupper() and contains_jsx(node)):
+                    sym_type = "component"
                 full_name = f"{parent_class}::{raw_name}" if (parent_class and language in ["cpp", "c", "rust"]) else (
                     f"{parent_class}.{raw_name}" if parent_class else raw_name
                 )
@@ -339,6 +412,14 @@ class ASTCodeChunker:
                 traverse(child, parent_class)
 
         traverse(root_node)
+
+        # Nomi univoci per file: due simboli con lo stesso nome (es. callback omonime, overload)
+        # non devono sovrascriversi nel grafo (id nodo = file::nome).
+        seen_names: Dict[str, int] = {}
+        for ch in chunks:
+            if ch.symbol_name in seen_names:
+                ch.symbol_name = f"{ch.symbol_name}@L{ch.start_line}"
+            seen_names[ch.symbol_name] = 1
 
         # Fallback a livello globale di modulo se non ci sono definizioni esplicite
         if not chunks and source_code.strip():

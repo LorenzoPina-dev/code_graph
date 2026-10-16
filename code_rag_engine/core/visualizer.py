@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 import networkx as nx
 from .agent_ui import AGENT_CSS, AGENT_PANEL_HTML, AGENT_JS
+from .flow_trace import FLOW_RELS, edge_rels, step_detail
 
 class Graph3DVisualizer:
     def __init__(self, graph: nx.DiGraph):
@@ -28,6 +29,19 @@ class Graph3DVisualizer:
         "method":     "#8be9fd",
         "module":     "#bd93f9",
         "code_block": "#f1fa8c",
+        # Livello dei flussi (UI / API / eventi)
+        "component":  "#ffa657",
+        "screen":     "#d2a8ff",
+        "endpoint":   "#f778ba",
+        "event":      "#e3b341",
+        "external":   "#8b949e",
+    }
+    # Colore per tipo di relazione (le prime tre sono strutturali, le altre sono i FLUSSI)
+    LINK_COLORS = {
+        "contains": "#bd93f9", "calls": "#ff5555", "imports": "#f1fa8c",
+        "renders": "#79c0ff", "navigates_to": "#3fb950", "redirects_to": "#d29922",
+        "api_call": "#f778ba", "handled_by": "#db61a2", "proxied_by": "#a371f7",
+        "publishes": "#e3b341", "consumes": "#e3b341",
     }
     DEFAULT_COLOR = "#f8f8f2"
 
@@ -76,20 +90,22 @@ class Graph3DVisualizer:
                 "val": val
             })
 
-        link_colors = {
-            "contains": "#bd93f9",
-            "calls": "#ff5555",
-            "imports": "#f1fa8c"
-        }
-
         for source, target, edge_data in self.graph.edges(data=True):
-            rel = edge_data.get("relation", "related")
-            links.append({
+            # Un arco puo' portare piu' relazioni (es. calls + renders): si mostrano tutte, il colore
+            # e' quello della prima relazione di flusso (se presente), cosi' i flussi non vengono coperti dai 'calls'.
+            rels = sorted(edge_rels(edge_data), key=lambda r: (r not in FLOW_RELS, r)) or ["related"]
+            link = {
                 "source": source,
                 "target": target,
-                "relation": rel,
-                "color": link_colors.get(rel, "#6272a4")
-            })
+                "relation": "+".join(rels),
+                "color": self.LINK_COLORS.get(rels[0], "#6272a4")
+            }
+            meta = edge_data.get("meta") or {}
+            details = [f"{r}: {step_detail({'meta': meta.get(r, {})})}" for r in rels if r in FLOW_RELS]
+            detail = " | ".join(d for d in details if not d.endswith(": "))
+            if detail:
+                link["detail"] = detail   # es. "navigates_to: value=register, via=onSwitch"
+            links.append(link)
 
         return {"nodes": nodes, "links": links, "code_store": code_store}
 
@@ -413,9 +429,15 @@ class Graph3DVisualizer:
       <label class="filter-row"><input type="checkbox" data-group="function" checked><span class="dot" style="background: #50fa7b;"></span> Funzioni <span class="cnt" id="cnt-function"></span></label>
       <label class="filter-row"><input type="checkbox" data-group="method" checked><span class="dot" style="background: #8be9fd;"></span> Metodi <span class="cnt" id="cnt-method"></span></label>
       <label class="filter-row"><input type="checkbox" data-group="module" checked><span class="dot" style="background: #bd93f9;"></span> Moduli <span class="cnt" id="cnt-module"></span></label>
+      <label class="filter-row"><input type="checkbox" data-group="component" checked><span class="dot" style="background: #ffa657;"></span> Componenti UI <span class="cnt" id="cnt-component"></span></label>
+      <label class="filter-row" title="Schermate, endpoint HTTP, eventi e servizi esterni"><input type="checkbox" data-group="flow" checked><span class="dot" style="background: #f778ba;"></span> Flussi: schermate / endpoint / eventi <span class="cnt" id="cnt-flow"></span></label>
       <div class="filter-title" style="margin-top: 8px;">Archi</div>
       <div class="legend-item"><span class="dot" style="background: #ff5555;"></span> Archi Calls (chiamate)</div>
       <div class="legend-item"><span class="dot" style="background: #bd93f9;"></span> Archi Contains (class/def)</div>
+      <div class="legend-item"><span class="dot" style="background: #79c0ff;"></span> renders (un componente ne mostra un altro)</div>
+      <div class="legend-item"><span class="dot" style="background: #3fb950;"></span> navigates_to / redirects_to (navigazione, redirect)</div>
+      <div class="legend-item"><span class="dot" style="background: #f778ba;"></span> api_call → handled_by (UI → endpoint → backend)</div>
+      <div class="legend-item"><span class="dot" style="background: #e3b341;"></span> publishes / consumes (eventi)</div>
       <button class="ui-btn on" id="btn-rotate">⟳ Rotazione automatica: ON</button>
       <button class="ui-btn" id="btn-reset">Deseleziona e mostra tutto</button>
     </div>
@@ -572,7 +594,7 @@ class Graph3DVisualizer:
       .linkDirectionalParticleWidth(1.2)
       .linkDirectionalParticleSpeed(0.006)
       .linkWidth(link => highlightLinks.has(link) ? 2.5 : (highlightMode() ? 0.3 : 1.2))
-      .linkLabel(link => link.relation)
+      .linkLabel(link => link.relation + (link.detail ? ' · ' + link.detail : ''))
       .onBackgroundClick(() => closeDetails())
       .onNodeClick(node => {{
         navHistory = [];
@@ -749,9 +771,11 @@ class Graph3DVisualizer:
       class: 'class', struct: 'class', interface: 'class',
       function: 'function',
       method: 'method',
-      module: 'module', code_block: 'module'
+      module: 'module', code_block: 'module',
+      component: 'component',
+      screen: 'flow', endpoint: 'flow', event: 'flow', external: 'flow'
     }};
-    const enabledGroups = {{ class: true, function: true, method: true, module: true }};
+    const enabledGroups = {{ class: true, function: true, method: true, module: true, component: true, flow: true }};
     const groupOf = type => GROUP_OF[type] || null;
     const isNodeVisible = n => {{ const g = groupOf(n.type); return !g || enabledGroups[g]; }};
 
@@ -764,7 +788,7 @@ class Graph3DVisualizer:
       if (selectedId && nodeById[selectedId] && !isNodeVisible(nodeById[selectedId])) closeDetails();
     }}
 
-    const groupCounts = {{ class: 0, function: 0, method: 0, module: 0 }};
+    const groupCounts = {{ class: 0, function: 0, method: 0, module: 0, component: 0, flow: 0 }};
     gData.nodes.forEach(n => {{ const g = groupOf(n.type); if (g) groupCounts[g]++; }});
     Object.keys(groupCounts).forEach(g => {{
       document.getElementById('cnt-' + g).textContent = groupCounts[g];

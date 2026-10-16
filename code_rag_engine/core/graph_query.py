@@ -17,6 +17,17 @@ import networkx as nx
 from .indexer import CodeGraphIndexer
 from .retriever import HybridRetriever
 from .reranker import CodeReranker
+from .flow_trace import (
+    FLOW_RELS, edge_rels, flow_direction, format_flow, has_flow_edges, has_flow_intent,
+    pick_start_nodes, trace_flow,
+)
+
+# Parole di domanda che non sono nomi di simboli (evita di usarle come punto di partenza di un flusso)
+_QUESTION_WORDS = {
+    "cosa", "come", "dove", "quale", "quali", "succede", "accade", "dopo", "prima", "poi", "funziona",
+    "flusso", "post", "pagina", "schermata", "funzione", "classe", "della", "dello", "nella", "sulla",
+    "what", "happens", "after", "before", "does", "work", "flow", "page", "this", "that", "with", "from",
+}
 
 class KnowledgeGraphQueryEngine:
     def __init__(self, indexer: CodeGraphIndexer, reranker: Optional[CodeReranker] = None):
@@ -43,10 +54,11 @@ class KnowledgeGraphQueryEngine:
             stype = data.get("symbol_type", "unknown")
             stats["counts_by_type"][stype] = stats["counts_by_type"].get(stype, 0) + 1
 
-        # Conteggio per tipologia di arco (calls, contains, imports)
+        # Conteggio per tipologia di arco (calls, contains, imports, e i flussi: renders, api_call, ...).
+        # Un arco puo' portare piu' relazioni insieme: si conta ciascuna.
         for _, _, data in self.graph.edges(data=True):
-            rel = data.get("relation", "related")
-            stats["relationships_by_type"][rel] = stats["relationships_by_type"].get(rel, 0) + 1
+            for rel in (edge_rels(data) or {"related"}):
+                stats["relationships_by_type"][rel] = stats["relationships_by_type"].get(rel, 0) + 1
 
         return stats
 
@@ -83,7 +95,7 @@ class KnowledgeGraphQueryEngine:
         callers = []
         for pred in self.graph.predecessors(target_node):
             edge = self.graph.get_edge_data(pred, target_node)
-            if edge.get("relation") == "calls":
+            if "calls" in edge_rels(edge):
                 callers.append({
                     "id": pred,
                     "symbol": self.graph.nodes[pred].get("symbol_name", pred),
@@ -94,7 +106,7 @@ class KnowledgeGraphQueryEngine:
         callees = []
         for succ in self.graph.successors(target_node):
             edge = self.graph.get_edge_data(target_node, succ)
-            if edge.get("relation") == "calls":
+            if "calls" in edge_rels(edge):
                 callees.append({
                     "id": succ,
                     "symbol": self.graph.nodes[succ].get("symbol_name", succ),
@@ -105,7 +117,7 @@ class KnowledgeGraphQueryEngine:
         container = None
         for pred in self.graph.predecessors(target_node):
             edge = self.graph.get_edge_data(pred, target_node)
-            if edge.get("relation") == "contains":
+            if "contains" in edge_rels(edge):
                 container = {
                     "id": pred,
                     "symbol": self.graph.nodes[pred].get("symbol_name", pred)
@@ -126,6 +138,61 @@ class KnowledgeGraphQueryEngine:
             "dependencies": node_data.get("dependencies", []),
             "code_snippet": node_data.get("content")
         }
+
+    # =========================================================================
+    # 1b. FLUSSI: cosa succede PRIMA / DOPO un simbolo (UI, redirect, API, eventi)
+    # =========================================================================
+
+    def trace_flows(self, symbol_name: str, direction: str = "both", max_depth: int = 4,
+                    max_steps: int = 40, max_starts: int = 2, exact_only: bool = False) -> Dict[str, Any]:
+        """
+        Segue gli archi di flusso (renders, navigates_to, redirects_to, api_call, handled_by, proxied_by,
+        publishes, consumes + calls) a partire da un simbolo, in avanti ('after'), all'indietro ('before')
+        o in entrambe le direzioni ('both'). Il punto di partenza e' scelto preferendo la UI
+        (componente) agli endpoint e alle funzioni.
+        """
+        starts = pick_start_nodes(self.graph, symbol_name, limit=max_starts, exact_only=exact_only)
+        if not starts:
+            return {"found": False, "message": f"Simbolo '{symbol_name}' non trovato nel grafo di conoscenza."}
+        dirs = ["before", "after"] if direction == "both" else [direction]
+        sections = []
+        for start in starts:
+            for d in dirs:
+                steps = trace_flow(self.graph, start, d, max_depth=max_depth, max_steps=max_steps)
+                sections.append({
+                    "start": start,
+                    "symbol": self.graph.nodes[start].get("symbol_name", start),
+                    "direction": d,
+                    "steps": steps,
+                    "text": format_flow(self.graph, steps, start),
+                })
+        return {"found": True, "sections": sections}
+
+    def _answer_flow_question(self, question: str) -> Optional[Dict[str, Any]]:
+        """
+        Risponde a 'cosa succede dopo X', 'come si arriva a X', 'come funziona X' quando X ha archi di
+        flusso. Restituisce None se la domanda non e' sui flussi o se X non ne ha (si ricade sugli altri intenti).
+        """
+        if not has_flow_intent(question):
+            return None
+        direction = flow_direction(question)
+        words = [w.strip("?,.:;\"'()") for w in question.split()]
+        words = [w for w in words if len(w) > 3 and w.lower() not in _QUESTION_WORDS]
+        for exact_only in (True, False):   # prima i nomi esatti, poi le corrispondenze parziali
+            for w in words:
+                flow = self.trace_flows(w, direction, exact_only=exact_only)
+                if not flow["found"]:
+                    continue
+                if not any(s["rel"] in FLOW_RELS for sec in flow["sections"] for s in sec["steps"]):
+                    continue
+                titles = {"before": "Cosa succede PRIMA (chi porta a)", "after": "Cosa succede DOPO"}
+                parts = [f"### Flusso per '{w}' — archi tipizzati (renders, navigates_to, redirects_to, api_call, "
+                         f"handled_by, publishes, calls)"]
+                for sec in flow["sections"]:
+                    body = sec["text"] if sec["steps"] else f"{sec['symbol']}\n  (nessun collegamento trovato)"
+                    parts.append(f"**{titles[sec['direction']]} `{sec['symbol']}`**\n```\n{body}\n```")
+                return {"type": "flow_answer", "answer": "\n\n".join(parts), "flow_details": flow}
+        return None
 
     # =========================================================================
     # 2. QUERY IN LINGUAGGIO NATURALE (GRAPH-AUGMENTED ANSWERING)
@@ -180,6 +247,12 @@ class KnowledgeGraphQueryEngine:
                 "answer": summary_text,
                 "raw_stats": stats
             }
+
+        # Intento 1b: flussi ("cosa succede dopo il login?", "come si arriva a X", "come funziona X")
+        if has_flow_edges(self.graph):
+            flow_answer = self._answer_flow_question(user_question)
+            if flow_answer:
+                return flow_answer
 
         # Intento 2: Ispezione specifica di un simbolo o del flusso
         # Estrai possibili simboli citati nella domanda

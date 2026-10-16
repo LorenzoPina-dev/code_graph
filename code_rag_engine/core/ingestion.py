@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pathspec
 from .chunker import ASTCodeChunker, CodeChunk
 from .indexer import CodeGraphIndexer
+from .flow_extractor import FlowFactsExtractor, link_flows
 
 SUPPORTED_EXTENSIONS = {
     ".py",
@@ -39,10 +40,14 @@ class RepositoryIngestionPipeline:
     - Batch di upsert Qdrant ottimizzato (dimensione 200)
     """
 
-    def __init__(self, indexer: CodeGraphIndexer, chunker: Optional[ASTCodeChunker] = None):
+    def __init__(self, indexer: CodeGraphIndexer, chunker: Optional[ASTCodeChunker] = None,
+                 extract_flows: bool = True):
         self.indexer = indexer
         self.chunker = chunker or ASTCodeChunker()
         self._seen_hashes: set = set()
+        # Se True, oltre ai simboli estrae i FLUSSI (render, navigazione, redirect, chiamate API,
+        # endpoint, eventi) e li collega nel grafo (vedi flow_extractor.py).
+        self.extract_flows = extract_flows
 
     # ──────────────────────────────────────────────────────────────────────
     # Internal helpers
@@ -135,6 +140,7 @@ class RepositoryIngestionPipeline:
         indexed_files = []
         total_chunks = 0
         pending_pairs: List[tuple] = []   # (rel_path, chunk)
+        all_facts: List[Any] = []         # fatti di flusso per file (fase 1 del flow extractor)
 
         def make_chunker():
             return ASTCodeChunker()
@@ -149,26 +155,31 @@ class RepositoryIngestionPipeline:
                 fp, rp = args
                 if not hasattr(_local, "chunker"):
                     _local.chunker = ASTCodeChunker()
+                if self.extract_flows and not hasattr(_local, "flow"):
+                    _local.flow = FlowFactsExtractor()   # un'istanza per thread: i parser non sono thread-safe
                 try:
                     size = fp.stat().st_size
                     if size == 0 or size > MAX_FILE_SIZE_BYTES:
-                        return (rp, None)
+                        return (rp, None, None)
                     with open(fp, "r", encoding="utf-8", errors="replace") as f:
                         source_code = f.read()
                     fhash = self._file_hash(source_code)
                     if fhash in self._seen_hashes:
-                        return (rp, None)
+                        return (rp, None, None)
                     self._seen_hashes.add(fhash)
                     chunks = _local.chunker.chunk_file(rp, source_code)
-                    return (rp, chunks if chunks else None)
+                    facts = _local.flow.extract(rp, source_code) if self.extract_flows else None
+                    return (rp, chunks if chunks else None, facts)
                 except Exception:
-                    return (rp, None)
+                    return (rp, None, None)
 
             futures = {executor.submit(_worker, args): args for args in valid_files}
             done = 0
             for future in as_completed(futures):
                 done += 1
-                rel_path, chunks = future.result()
+                rel_path, chunks, facts = future.result()
+                if facts is not None:
+                    all_facts.append(facts)
                 if chunks:
                     indexed_files.append(rel_path)
                     total_chunks += len(chunks)
@@ -192,10 +203,22 @@ class RepositoryIngestionPipeline:
             print("[*] Costruzione archi 'calls' nel grafo CPG...")
         self.indexer._resolve_graph_calls()
 
+        # ── Fase 5: archi di FLUSSO (dopo i 'calls': il linker li affianca senza sovrascriverli) ──
+        flow_stats: Dict[str, Any] = {}
+        if self.extract_flows and all_facts:
+            if show_progress:
+                print("[*] Collegamento dei flussi (render, navigazione, redirect, API, eventi)...")
+            try:
+                flow_stats = link_flows(self.indexer.graph, all_facts)
+            except Exception as e:   # i flussi sono un arricchimento: non devono far fallire l'ingestione
+                print(f"[!] Collegamento dei flussi fallito: {e!r}")
+                flow_stats = {"flow_error": repr(e)}
+
         return {
             "indexed_files_count": len(indexed_files),
             "total_chunks_count": total_chunks,
             "indexed_files": indexed_files,
             "cpg_nodes": self.indexer.graph.number_of_nodes(),
-            "cpg_edges": self.indexer.graph.number_of_edges()
+            "cpg_edges": self.indexer.graph.number_of_edges(),
+            **flow_stats
         }
