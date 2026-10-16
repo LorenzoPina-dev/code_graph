@@ -27,5 +27,5 @@ datasets>=2.19             # importato da core/universal_ingestion.py anche per 
 # --- Test ---
 pytest>=8.0
 
-# --- Opzionale: spiegazioni discorsive dell'agente (serve anche ANTHROPIC_API_KEY) ---
+# --- Opzionale: spiegazioni Anthropic (i provider OpenAI-compatible usano la stdlib) ---
 # anthropic>=0.40

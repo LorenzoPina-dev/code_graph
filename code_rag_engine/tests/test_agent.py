@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import networkx as nx
 import pytest
 
-from core.agent import GraphQuestionAgent
+from core.agent import GraphQuestionAgent, OpenAICompatibleSynthesizer, build_default_llm
 
 
 # ----------------------------------------------------------------------------- grafo di prova
@@ -129,6 +129,23 @@ def test_semantic_seeds_are_used_without_explicit_symbol(toy):
     assert res["focus"][0]["id"] == ids.verify and res["focus"][0]["role"] == "match"
 
 
+def test_code_request_excludes_unrelated_ocr_candidates():
+    g = nx.DiGraph()
+    register = _add(g, "services/auth/register.ts", "registerAccount",
+                    calls=["createUser"], line=10)
+    create_user = _add(g, "services/auth/users.ts", "createUser", line=30)
+    ocr = _add(g, "py/ocr/quality/enhance.py", "edge_contrast",
+               typ="method", line=130)
+    g.add_edge(register, create_user, relation="calls")
+    agent = make_agent(g, [ocr, register], FakeReranker())
+    result = agent.ask("mi dai il codice della query per registrare un nuovo account?")
+    focus_ids = {item["id"] for item in result["focus"]}
+    assert register in focus_ids
+    assert ocr not in focus_ids
+    assert result["trace"]["prompt_context"]
+    assert all("ocr" not in item["file"].lower() for item in result["trace"]["prompt_context"])
+
+
 def test_rerank_margin_drops_weak_seed(toy):
     g, ids = toy
     res = make_agent(g, [ids.hash, ids.login], FakeReranker()).ask("gestione dell'accesso utente")
@@ -148,6 +165,35 @@ def test_result_is_json_serialisable_and_has_stats(toy):
     json.dumps(res)
     assert res["stats"]["nodes"] == len(res["focus"])
     assert res["stats"]["matches"] >= 1
+    assert res["trace"]["context_nodes"]
+    assert res["trace"]["used_nodes"]
+    assert res["trace"]["prompt_context"][0]["content_excerpt"]
+    assert "flow_context" in res["trace"]
+    assert any(step["tool"] == "graph_expansion" for step in res["trace"]["steps"])
+
+
+def test_follow_up_question_reuses_previous_graph_context(toy):
+    g, ids = toy
+    agent = make_agent(g, [], FakeReranker())
+    agent.ask("cosa fa la funzione login?")
+    result = agent.ask("e cosa succede dopo questa?")
+    assert result["trace"]["seed_nodes"]
+    assert ids.login in result["trace"]["seed_nodes"]
+    assert result["conversation"]["previous_turns"] == 1
+
+
+def test_flow_trace_deduplicates_edges_across_seed_paths():
+    g = nx.DiGraph()
+    first = _add(g, "ui.tsx", "Login", "component")
+    second = _add(g, "app.tsx", "App", "component")
+    target = _add(g, "auth.ts", "authenticate")
+    g.add_edge(second, first, relation="renders")
+    g.add_edge(first, target, relation="calls")
+    agent = make_agent(g)
+    result = agent.ask("qual è il prima e dopo Login?")
+    text = result["answer"]
+    assert text.count("App --renders--> Login") <= 1
+    assert text.count("Login --calls--> authenticate") <= 1
 
 
 # ----------------------------------------------------------------------------- casi particolari
@@ -219,6 +265,8 @@ def test_llm_failure_falls_back_to_deterministic_answer(toy):
     res = make_agent(g, [], FakeReranker(), llm=LlmBroken()).ask("cosa fa la funzione login?")
     assert res["mode"] == "retrieval"
     assert res["focus"] and "`login`" in res["answer"]
+    llm_steps = [s for s in res["trace"]["steps"] if s["tool"] == "llm_synthesis"]
+    assert llm_steps and llm_steps[0]["status"] == "failed"
 
 
 def test_llm_ignores_out_of_range_and_duplicate_indices(toy):
@@ -241,3 +289,36 @@ def test_llm_ignores_out_of_range_and_duplicate_indices(toy):
 ])
 def test_parse_json_is_tolerant(raw, expected):
     assert GraphQuestionAgent._parse_json(raw) == expected
+
+
+def test_openai_compatible_provider_is_configurable(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("core.agent.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setenv("CODE_RAG_LLM_PROVIDER", "groq")
+    monkeypatch.setenv("CODE_RAG_LLM_API_KEY", "test-key")
+    monkeypatch.setenv("CODE_RAG_LLM_BASE_URL", "https://example.test/openai/v1")
+    monkeypatch.setenv("CODE_RAG_LLM_MODEL", "test-model")
+
+    llm = build_default_llm()
+    assert isinstance(llm, OpenAICompatibleSynthesizer)
+    assert llm.complete("system", "user") == "ok"
+    assert captured == {
+        "url": "https://example.test/openai/v1/chat/completions",
+        "timeout": 90,
+    }

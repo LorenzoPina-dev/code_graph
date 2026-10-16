@@ -134,6 +134,22 @@ AGENT_CSS = r"""
       white-space: nowrap;
     }
     #instructions { max-width: 260px; }
+    .agent-trace {
+      margin-top: 10px;
+      border-top: 1px solid #30363d;
+      padding-top: 8px;
+      color: #8b949e;
+      font-size: 11px;
+    }
+    .agent-trace summary { cursor: pointer; color: #58a6ff; }
+    .agent-trace-row { padding: 3px 0; }
+    .agent-trace-edge { font-family: monospace; color: #c9d1d9; }
+    .agent-context-item { cursor: pointer; border: 1px solid #30363d; border-radius: 5px; padding: 5px; margin-top: 4px; }
+    .agent-context-item:hover { background: #21262d; }
+    .agent-context-code { display: block; margin-top: 3px; color: #7ee787; white-space: pre-wrap; max-height: 90px; overflow: hidden; }
+    .agent-turn { border-bottom: 1px solid #21262d; padding-bottom: 10px; margin-bottom: 10px; }
+    .agent-history { color: #8b949e; font-size: 11px; margin-bottom: 8px; }
+    .agent-history-question { color: #c9d1d9; margin-top: 4px; }
 """
 
 AGENT_PANEL_HTML = r"""
@@ -155,7 +171,7 @@ AGENT_JS = r"""
     const ROLE_LABEL = {
       match: 'rilevante', callee: 'chiamato', caller: 'chiamante',
       next: 'poi', previous: 'prima',
-      container: 'contenitore', member: 'membro'
+      container: 'contenitore', member: 'membro', context: 'contesto agente'
     };
 
     function escapeHtml(s) {
@@ -252,22 +268,102 @@ AGENT_JS = r"""
       const agentSend = document.getElementById('agent-send');
       const agentClear = document.getElementById('agent-clear');
       const agentOut = document.getElementById('agent-out');
+      const agentTranscript = [];
 
       function renderAnswer(data) {
         agentOut.innerHTML = '';
         agentOut.style.display = 'block';
 
+        agentTranscript.push({question: data.question || '', answer: data.answer || ''});
+        if (agentTranscript.length > 1) {
+          const history = document.createElement('div');
+          history.className = 'agent-history';
+          history.textContent = 'Conversazione precedente';
+          agentTranscript.slice(0, -1).forEach(turn => {
+            const q = document.createElement('div');
+            q.className = 'agent-history-question';
+            q.textContent = 'Tu: ' + turn.question;
+            history.appendChild(q);
+          });
+          agentOut.appendChild(history);
+        }
+
+        const turn = document.createElement('div');
+        turn.className = 'agent-turn';
         const ans = document.createElement('div');
         ans.className = 'agent-answer';
         ans.innerHTML = renderRich(data.answer || '');
-        agentOut.appendChild(ans);
+        turn.appendChild(ans);
 
         const mode = document.createElement('div');
         mode.className = 'agent-mode';
         mode.textContent = data.mode === 'llm'
           ? 'Risposta sintetizzata da LLM sui simboli trovati nel grafo'
-          : 'Ricerca ibrida + grafo (nessun LLM configurato: imposta ANTHROPIC_API_KEY per una spiegazione discorsiva)';
-        agentOut.appendChild(mode);
+          : 'Ricerca ibrida + grafo (nessun LLM configurato: imposta una chiave provider per una spiegazione discorsiva)';
+        turn.appendChild(mode);
+        agentOut.appendChild(turn);
+
+        const trace = data.trace || {};
+        const traceBox = document.createElement('details');
+        traceBox.className = 'agent-trace';
+        const summary = document.createElement('summary');
+        summary.textContent = 'Come ho costruito la risposta';
+        traceBox.appendChild(summary);
+        (trace.steps || []).forEach(step => {
+          const row = document.createElement('div');
+          row.className = 'agent-trace-row';
+          const icon = step.status === 'failed' ? '!' : '✓';
+          row.textContent = icon + ' ' + step.tool + (step.count !== undefined ? ' (' + step.count + ')' : '') +
+            (step.description ? ' — ' + step.description : '');
+          if (step.status === 'failed') row.style.color = '#ff7b72';
+          traceBox.appendChild(row);
+        });
+        const contextCount = (trace.context_nodes || []).length;
+        const usedCount = (trace.used_nodes || []).length;
+        const edgeCount = (trace.navigated_edges || []).length;
+        const counts = document.createElement('div');
+        counts.className = 'agent-trace-row';
+        counts.textContent = 'Contesto passato: ' + contextCount +
+          ' nodi · usati nella risposta: ' + usedCount + ' · archi navigati: ' + edgeCount;
+        traceBox.appendChild(counts);
+        (trace.navigated_edges || []).slice(0, 20).forEach(edge => {
+          const row = document.createElement('div');
+          row.className = 'agent-trace-row agent-trace-edge';
+          row.textContent = edge.source_name + ' —[' + (edge.relations || []).join(', ') +
+            ']→ ' + edge.target_name;
+          traceBox.appendChild(row);
+        });
+        const promptTitle = document.createElement('div');
+        promptTitle.className = 'agent-trace-row';
+        promptTitle.textContent = 'Materiale passato al modello';
+        traceBox.appendChild(promptTitle);
+        (trace.prompt_context || []).forEach(item => {
+          const row = document.createElement('div');
+          row.className = 'agent-context-item';
+          row.title = 'Apri questo nodo nel grafo';
+          row.innerHTML = '<b>' + escapeHtml(item.name || item.id) + '</b> · ' +
+            escapeHtml(item.role || 'context') + '<br>' +
+            escapeHtml(item.file || '') + ':' + escapeHtml(item.start_line || 0) +
+            '-' + escapeHtml(item.end_line || 0);
+          if (item.content_excerpt) {
+            const code = document.createElement('code');
+            code.className = 'agent-context-code';
+            code.textContent = item.content_excerpt;
+            row.appendChild(code);
+          }
+          row.addEventListener('click', () => {
+            const node = nodeById[item.id];
+            if (node) { openDetails(node, false, true); flyTo(node); }
+          });
+          traceBox.appendChild(row);
+        });
+        if (trace.flow_context) {
+          const flow = document.createElement('pre');
+          flow.className = 'agent-trace-row';
+          flow.textContent = trace.flow_context;
+          traceBox.appendChild(flow);
+        }
+        turn.appendChild(traceBox);
 
         const focus = (data.focus || []).filter(f => nodeById[f.id]);
         if (!focus.length) return;
@@ -311,7 +407,12 @@ AGENT_JS = r"""
           const data = await res.json().catch(() => ({}));
           if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
           renderAnswer(data);
-          setFocus(data.focus || []);
+          const selected = data.focus || [];
+          const selectedIds = new Set(selected.map(f => f.id));
+          const context = ((data.trace || {}).context_nodes || [])
+            .filter(id => !selectedIds.has(id))
+            .map(id => ({id: id, role: 'context'}));
+          setFocus(selected.concat(context));
         } catch (err) {
           agentOut.innerHTML = '<div class="agent-status err">Errore: ' + escapeHtml(err.message) + '</div>';
         } finally {

@@ -7,8 +7,10 @@ Esempi:
   python serve_graph.py D:/mio_progetto --port 8800
   python serve_graph.py ./core --no-llm
 
-Spiegazioni discorsive con LLM (opzionale): imposta ANTHROPIC_API_KEY (e, se vuoi,
-CODE_RAG_LLM_MODEL). Senza chiave l'agente usa solo ricerca ibrida + grafo.
+Spiegazioni discorsive con LLM (opzionale): imposta ANTHROPIC_API_KEY oppure
+CODE_RAG_LLM_PROVIDER, CODE_RAG_LLM_API_KEY, CODE_RAG_LLM_BASE_URL e
+CODE_RAG_LLM_MODEL per un provider OpenAI-compatible. Senza chiave l'agente usa
+solo ricerca ibrida + grafo.
 
 Il server ascolta solo su 127.0.0.1: non ha autenticazione e espone il codice indicizzato.
 """
