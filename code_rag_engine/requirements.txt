@@ -1,0 +1,31 @@
+# Code RAG Engine - dipendenze
+# Python 3.10 o superiore. Installazione:   pip install -r requirements.txt
+# Serve anche `git` nel PATH (per clonare i repository GitHub).
+
+# --- Parsing AST (Tree-sitter + grammatiche usate da core/chunker.py) ---
+tree-sitter>=0.23
+tree-sitter-python
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-c
+tree-sitter-cpp
+tree-sitter-c-sharp
+tree-sitter-java
+tree-sitter-go
+tree-sitter-rust
+
+# --- Indicizzazione e ricerca ibrida ---
+qdrant-client>=1.10        # query_points()
+fastembed>=0.5.0           # embedding denso (bge-small) + sparso (Qdrant/bm25)
+sentence-transformers>=2.7 # reranker Cross-Encoder (porta con se' PyTorch)
+
+# --- Grafo, ingestione, filtri .gitignore ---
+networkx>=3.0
+pathspec>=0.12
+datasets>=2.19             # importato da core/universal_ingestion.py anche per repo e cartelle
+
+# --- Test ---
+pytest>=8.0
+
+# --- Opzionale: spiegazioni discorsive dell'agente (serve anche ANTHROPIC_API_KEY) ---
+# anthropic>=0.40

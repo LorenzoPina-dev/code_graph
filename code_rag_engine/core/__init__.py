@@ -10,6 +10,7 @@ from .visualizer import Graph3DVisualizer
 from .dataset_ingestion import DatasetIngestionPipeline
 from .graph_query import KnowledgeGraphQueryEngine
 from .universal_ingestion import UniversalIngestionPipeline
+from .agent import GraphQuestionAgent
 
 __all__ = [
     "ASTCodeChunker",
@@ -23,5 +24,6 @@ __all__ = [
     "DatasetIngestionPipeline",
     "KnowledgeGraphQueryEngine",
     "UniversalIngestionPipeline",
+    "GraphQuestionAgent",
 ]
 

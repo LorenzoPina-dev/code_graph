@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Optional
 import networkx as nx
+from .agent_ui import AGENT_CSS, AGENT_PANEL_HTML, AGENT_JS
 
 class Graph3DVisualizer:
     def __init__(self, graph: nx.DiGraph):
@@ -101,12 +102,16 @@ class Graph3DVisualizer:
                  .replace("\u2028", "\\u2028")
                  .replace("\u2029", "\\u2029"))
 
-    def export_html(self, output_path: str = "graph_3d_viewer.html", title: str = "Code Property Graph 3D Explorer") -> str:
+    def render_html(self, title: str = "Code Property Graph 3D Explorer", agent_endpoint: Optional[str] = None) -> str:
         """Genera un file HTML autonomo che renderizza il grafo 3D interattivo."""
         graph_data = self.to_graph_data()
         code_store = graph_data.pop("code_store", {})
         graph_json = self._safe_json(json.dumps(graph_data, ensure_ascii=False, separators=(',', ':')))
         code_store_json = self._safe_json(json.dumps(code_store, ensure_ascii=False, separators=(',', ':')))
+
+        # Pannello "Chiedi al grafo": presente solo se il viewer è servito con un endpoint agente
+        agent_panel_html = AGENT_PANEL_HTML if agent_endpoint else ""
+        agent_js = AGENT_JS.replace("__AGENT_ENDPOINT__", json.dumps(agent_endpoint))
 
         html_template = f"""<!DOCTYPE html>
 <html lang="it">
@@ -273,6 +278,13 @@ class Graph3DVisualizer:
       font-family: monospace;
       color: #7ee787;
     }}
+    .filter-title {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #8b949e; margin: 14px 0 2px; }}
+    .filter-row {{ display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; padding: 2px 0; }}
+    .filter-row input {{ accent-color: #58a6ff; cursor: pointer; margin: 0; }}
+    .filter-row .cnt {{ margin-left: auto; color: #6e7681; font-size: 11px; font-family: monospace; }}
+    .ui-btn {{ margin-top: 8px; width: 100%; padding: 6px 10px; background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; cursor: pointer; }}
+    .ui-btn:hover {{ background: #30363d; }}
+    .ui-btn.on {{ border-color: #58a6ff; color: #58a6ff; }}
     #instructions {{
       position: absolute;
       bottom: 15px;
@@ -376,6 +388,7 @@ class Graph3DVisualizer:
     }}
     #nav-back:hover {{ color: #58a6ff; }}
     #nav-back-label {{ font-family: monospace; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+{AGENT_CSS}
   </style>
   <script src="https://unpkg.com/3d-force-graph@1.73.3/dist/3d-force-graph.min.js"></script>
 </head>
@@ -394,20 +407,24 @@ class Graph3DVisualizer:
     
     <input type="text" id="search-input" class="search-box" placeholder="Cerca simbolo o file...">
 
+    <div class="filter-title">Filtra per tipo</div>
     <div class="legend">
-      <div class="legend-item"><span class="dot" style="background: #ff79c6;"></span> Classi</div>
-      <div class="legend-item"><span class="dot" style="background: #50fa7b;"></span> Funzioni</div>
-      <div class="legend-item"><span class="dot" style="background: #8be9fd;"></span> Metodi</div>
-      <div class="legend-item"><span class="dot" style="background: #bd93f9;"></span> Moduli</div>
+      <label class="filter-row" title="class, struct, interface"><input type="checkbox" data-group="class" checked><span class="dot" style="background: #ff79c6;"></span> Classi <span class="cnt" id="cnt-class"></span></label>
+      <label class="filter-row"><input type="checkbox" data-group="function" checked><span class="dot" style="background: #50fa7b;"></span> Funzioni <span class="cnt" id="cnt-function"></span></label>
+      <label class="filter-row"><input type="checkbox" data-group="method" checked><span class="dot" style="background: #8be9fd;"></span> Metodi <span class="cnt" id="cnt-method"></span></label>
+      <label class="filter-row"><input type="checkbox" data-group="module" checked><span class="dot" style="background: #bd93f9;"></span> Moduli <span class="cnt" id="cnt-module"></span></label>
+      <div class="filter-title" style="margin-top: 8px;">Archi</div>
       <div class="legend-item"><span class="dot" style="background: #ff5555;"></span> Archi Calls (chiamate)</div>
       <div class="legend-item"><span class="dot" style="background: #bd93f9;"></span> Archi Contains (class/def)</div>
+      <button class="ui-btn on" id="btn-rotate">⟳ Rotazione automatica: ON</button>
+      <button class="ui-btn" id="btn-reset">Deseleziona e mostra tutto</button>
     </div>
   </div>
 
   <div id="details-panel">
     <div id="details-header">
       <span id="details-title">Nome Simbolo</span>
-      <button class="close-btn" onclick="closeDetails()">&times;</button>
+      <button class="close-btn" onclick="closePanel()">&times;</button>
     </div>
     <div id="details-body">
 
@@ -462,8 +479,10 @@ class Graph3DVisualizer:
     </div>
   </div>
 
+{agent_panel_html}
+
   <div id="instructions">
-    Trascina: Ruota 3D | Rotella: Zoom | Clic su nodo: Ispeziona &amp; Focus
+    Trascina: Ruota 3D | Rotella: Zoom | Clic su nodo: evidenzia i collegamenti (la rotazione si ferma) | Clic sullo sfondo: deseleziona
   </div>
 
   <script>
@@ -490,21 +509,71 @@ class Graph3DVisualizer:
     let navTabMode = 'out';
     let navHistory = [];   // stack of {{id, name}} for back navigation
 
+    // ── Selezione / evidenziazione del vicinato ──
+    let selectedId = null;
+    let focusActive = false;            // evidenziazione prodotta dall'agente (più nodi)
+    const emphasisNodes = new Set();    // nodi "accesi": il selezionato oppure i match dell'agente
+    const highlightMode = () => !!selectedId || focusActive;
+    const highlightNodes = new Set();   // id del nodo selezionato + vicini diretti
+    const highlightLinks = new Set();   // archi collegati al nodo selezionato
+    const linkId = e => (typeof e === 'object') ? e.id : e;
+
+    function hexToRgba(hex, a) {{
+      const h = hex.replace('#', '');
+      const r = parseInt(h.substring(0, 2), 16), g = parseInt(h.substring(2, 4), 16), b = parseInt(h.substring(4, 6), 16);
+      return `rgba(${{r}},${{g}},${{b}},${{a}})`;
+    }}
+    function nodeColorFn(node) {{
+      if (!highlightMode()) return node.color;
+      if (emphasisNodes.has(node.id)) return focusActive ? '#ffd33d' : '#ffffff';              // nodo selezionato: acceso
+      return highlightNodes.has(node.id) ? node.color : hexToRgba(node.color, 0.07);
+    }}
+    function linkColorFn(link) {{
+      if (!highlightMode()) return link.color;
+      return highlightLinks.has(link) ? link.color : 'rgba(110,118,129,0.04)';
+    }}
+    function refreshGraphStyle() {{
+      Graph.nodeColor(Graph.nodeColor()).nodeVal(Graph.nodeVal())
+           .linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth())
+           .linkDirectionalParticles(Graph.linkDirectionalParticles());
+    }}
+    function setSelection(id) {{
+      selectedId = id;
+      focusActive = false;
+      emphasisNodes.clear();
+      if (id) emphasisNodes.add(id);
+      highlightNodes.clear();
+      highlightLinks.clear();
+      if (id) {{
+        highlightNodes.add(id);
+        gData.links.forEach(l => {{
+          const s = linkId(l.source), t = linkId(l.target);
+          if (s === id || t === id) {{
+            highlightLinks.add(l);
+            highlightNodes.add(s);
+            highlightNodes.add(t);
+          }}
+        }});
+      }}
+      refreshGraphStyle();
+    }}
+
     const Graph = ForceGraph3D()(document.getElementById('graph-3d'))
       .graphData(gData)
       .nodeId('id')
       .nodeLabel(node => `${{node.name}} [${{node.type}}]\\n${{node.fp}}`)
-      .nodeColor(node => node.color)
-      .nodeVal(node => node.val)
+      .nodeColor(node => nodeColorFn(node))
+      .nodeVal(node => emphasisNodes.has(node.id) ? node.val * 3 : node.val)
       .nodeResolution(16)
       .linkSource('source')
       .linkTarget('target')
-      .linkColor(link => link.color)
-      .linkDirectionalParticles(2)
+      .linkColor(link => linkColorFn(link))
+      .linkDirectionalParticles(link => highlightLinks.has(link) ? 4 : (highlightMode() ? 0 : 2))
       .linkDirectionalParticleWidth(1.2)
       .linkDirectionalParticleSpeed(0.006)
-      .linkWidth(1.2)
+      .linkWidth(link => highlightLinks.has(link) ? 2.5 : (highlightMode() ? 0.3 : 1.2))
       .linkLabel(link => link.relation)
+      .onBackgroundClick(() => closeDetails())
       .onNodeClick(node => {{
         navHistory = [];
         openDetails(node, false);
@@ -524,12 +593,21 @@ class Graph3DVisualizer:
 
     function focusNode(node) {{
       if (!node || node.x === undefined) return;
-      const distance = 80;
-      const distRatio = 1 + distance / Math.hypot(node.x || 1, node.y || 1, node.z || 1);
+      // Zoom moderato: la distanza si adatta al raggio del vicinato, così si vede
+      // l'intera rete di collegamenti del nodo senza avvicinarsi troppo.
+      let radius = 0;
+      highlightNodes.forEach(id => {{
+        const m = nodeById[id];
+        if (m && m.x !== undefined) radius = Math.max(radius, Math.hypot(m.x - node.x, m.y - node.y, m.z - node.z));
+      }});
+      const distance = Math.min(700, Math.max(180, radius * 2.2 + 80));
+      const cam = Graph.cameraPosition();
+      const dx = cam.x - node.x, dy = cam.y - node.y, dz = cam.z - node.z;
+      const len = Math.hypot(dx, dy, dz) || 1;
       Graph.cameraPosition(
-        {{ x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio }},
+        {{ x: node.x + dx / len * distance, y: node.y + dy / len * distance, z: node.z + dz / len * distance }},
         node,
-        1200
+        1000
       );
     }}
 
@@ -591,9 +669,19 @@ class Graph3DVisualizer:
     }}
 
     // ── Details panel ──
-    function openDetails(node, keepHistory) {{
+    function openDetails(node, keepHistory, keepFocus) {{
       if (!keepHistory) navHistory = [];
       currentNodeId = node.id;
+
+      // Se il tipo del nodo è filtrato, riattiva il filtro corrispondente
+      const grp = groupOf(node.type);
+      if (grp && !enabledGroups[grp]) {{
+        enabledGroups[grp] = true;
+        const cb = document.querySelector(`input[data-group="${{grp}}"]`);
+        if (cb) cb.checked = true;
+        applyFilters();
+      }}
+      if (!keepFocus) setSelection(node.id);   // accende nodo + vicini, attenua il resto, ferma la rotazione
 
       document.getElementById('details-title').textContent = node.name;
       document.getElementById('meta-type').textContent = node.type.toUpperCase();
@@ -650,8 +738,84 @@ class Graph3DVisualizer:
     function closeDetails() {{
       document.getElementById('details-panel').style.display = 'none';
       currentNodeId = null;
+      const wasSelected = highlightMode();
+      setSelection(null);
+      if (wasSelected) resumeRotation();
       navHistory = [];
     }}
+
+    // ── Filtri per tipo di simbolo ──
+    const GROUP_OF = {{
+      class: 'class', struct: 'class', interface: 'class',
+      function: 'function',
+      method: 'method',
+      module: 'module', code_block: 'module'
+    }};
+    const enabledGroups = {{ class: true, function: true, method: true, module: true }};
+    const groupOf = type => GROUP_OF[type] || null;
+    const isNodeVisible = n => {{ const g = groupOf(n.type); return !g || enabledGroups[g]; }};
+
+    function applyFilters() {{
+      Graph.nodeVisibility(isNodeVisible)
+           .linkVisibility(l => {{
+             const s = nodeById[linkId(l.source)], t = nodeById[linkId(l.target)];
+             return !!s && !!t && isNodeVisible(s) && isNodeVisible(t);
+           }});
+      if (selectedId && nodeById[selectedId] && !isNodeVisible(nodeById[selectedId])) closeDetails();
+    }}
+
+    const groupCounts = {{ class: 0, function: 0, method: 0, module: 0 }};
+    gData.nodes.forEach(n => {{ const g = groupOf(n.type); if (g) groupCounts[g]++; }});
+    Object.keys(groupCounts).forEach(g => {{
+      document.getElementById('cnt-' + g).textContent = groupCounts[g];
+    }});
+    document.querySelectorAll('input[data-group]').forEach(cb => {{
+      cb.addEventListener('change', () => {{
+        enabledGroups[cb.dataset.group] = cb.checked;
+        applyFilters();
+      }});
+    }});
+
+    // ── Rotazione automatica (si ferma quando c'è un nodo selezionato) ──
+    let autoRotate = true;
+    let userDragging = false;
+    let rotationPausedUntil = 0;
+    const rotBtn = document.getElementById('btn-rotate');
+    document.getElementById('graph-3d').addEventListener('pointerdown', () => {{ userDragging = true; }});
+    window.addEventListener('pointerup', () => {{ userDragging = false; }});
+
+    function resumeRotation() {{
+      // riporta lo sguardo al centro del grafo prima di riprendere l'orbita
+      const c = Graph.cameraPosition();
+      Graph.cameraPosition({{ x: c.x, y: c.y, z: c.z }}, {{ x: 0, y: 0, z: 0 }}, 1000);
+      rotationPausedUntil = Date.now() + 1100;
+    }}
+
+    setInterval(() => {{
+      if (!autoRotate || highlightMode() || userDragging || Date.now() < rotationPausedUntil) return;
+      const c = Graph.cameraPosition();
+      const r = Math.hypot(c.x, c.z);
+      if (r < 1) return;
+      const a = Math.atan2(c.x, c.z) + 0.0025;
+      Graph.cameraPosition({{ x: r * Math.sin(a), y: c.y, z: r * Math.cos(a) }});
+    }}, 16);
+
+    rotBtn.addEventListener('click', () => {{
+      autoRotate = !autoRotate;
+      rotBtn.classList.toggle('on', autoRotate);
+      rotBtn.textContent = '⟳ Rotazione automatica: ' + (autoRotate ? 'ON' : 'OFF');
+    }});
+
+    document.getElementById('btn-reset').addEventListener('click', () => {{
+      document.querySelectorAll('input[data-group]').forEach(cb => {{
+        cb.checked = true;
+        enabledGroups[cb.dataset.group] = true;
+      }});
+      applyFilters();
+      closeDetails();
+    }});
+
+{agent_js}
 
     // ── Ricerca simboli e zoom ──
     document.getElementById('search-input').addEventListener('input', (e) => {{
@@ -674,8 +838,15 @@ class Graph3DVisualizer:
 </html>"""
 
 
+        return html_template
+
+    def export_html(self, output_path: str = "graph_3d_viewer.html",
+                    title: str = "Code Property Graph 3D Explorer",
+                    agent_endpoint: Optional[str] = None) -> str:
+        """Scrive su disco l'HTML del visualizzatore (con il pannello agente se agent_endpoint è impostato)."""
+        html = self.render_html(title=title, agent_endpoint=agent_endpoint)
         path = Path(output_path).resolve()
         with open(path, "w", encoding="utf-8") as f:
-            f.write(html_template)
+            f.write(html)
         return str(path)
 
